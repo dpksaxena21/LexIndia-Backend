@@ -108,6 +108,10 @@ class SaveDraftRequest(BaseModel):
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 
+@app.get("/debug-env")
+def debug_env():
+    return {"db_set": DATABASE_URL is not None, "db_start": str(DATABASE_URL)[:20] if DATABASE_URL else "NONE"}
+
 @app.get("/")
 def root():
     return {"status": "LexIndia API running"}
