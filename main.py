@@ -22,7 +22,7 @@ SECRET_KEY    = os.getenv("SECRET_KEY", "change-this-in-production-use-a-long-ra
 ALGORITHM     = "HS256"
 TOKEN_EXPIRY  = 30  # days
 
-DATABASE_URL         = os.getenv("DATABASE_URL")
+DATABASE_URL         = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_PUBLIC_URL")
 CLAUDE_API_KEY       = os.getenv("CLAUDE_API_KEY")
 INDIAN_KANOON_TOKEN  = os.getenv("INDIAN_KANOON_TOKEN")
 
