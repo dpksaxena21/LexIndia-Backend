@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
 import anthropic
 import requests
@@ -9,24 +10,17 @@ import os
 import json
 import psycopg2
 import psycopg2.extras
-from dotenv import load_dotenv
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 
-# load_dotenv()
+SECRET_KEY   = os.getenv("SECRET_KEY", "change-this-in-production-use-a-long-random-string")
+ALGORITHM    = "HS256"
+TOKEN_EXPIRY = 30
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-SECRET_KEY    = os.getenv("SECRET_KEY", "change-this-in-production-use-a-long-random-string")
-ALGORITHM     = "HS256"
-TOKEN_EXPIRY  = 30  # days
-
-DATABASE_URL         = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_PUBLIC_URL")
-CLAUDE_API_KEY       = os.getenv("CLAUDE_API_KEY")
-INDIAN_KANOON_TOKEN  = os.getenv("INDIAN_KANOON_TOKEN")
-
-# ── App ───────────────────────────────────────────────────────────────────────
+DATABASE_URL        = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+CLAUDE_API_KEY      = os.getenv("CLAUDE_API_KEY")
+INDIAN_KANOON_TOKEN = os.getenv("INDIAN_KANOON_TOKEN")
 
 app = FastAPI(title="LexIndia API")
 
@@ -42,12 +36,8 @@ claude  = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer  = HTTPBearer(auto_error=False)
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-
 def get_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-
-# ── JWT helpers ───────────────────────────────────────────────────────────────
 
 def create_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(days=TOKEN_EXPIRY)
@@ -73,8 +63,6 @@ def optional_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> Opti
     except HTTPException:
         return None
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
-
 class RegisterRequest(BaseModel):
     email: str
     name: str
@@ -90,7 +78,7 @@ class SearchRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list = []
-    session_id: Optional[str] = None   # if provided, load+save to DB
+    session_id: Optional[str] = None
 
 class DraftRequest(BaseModel):
     doc_type: str
@@ -99,14 +87,10 @@ class DraftRequest(BaseModel):
     respondent: str
     facts: str
     grounds: str
-    save: bool = False                  # if True + auth, save to documents table
+    save: bool = False
 
-class SaveDraftRequest(BaseModel):
-    doc_type: str
-    title: str
-    content: str
-
-# ── Auth endpoints ────────────────────────────────────────────────────────────
+class GoogleAuthRequest(BaseModel):
+    access_token: str
 
 @app.get("/debug-env")
 def debug_env():
@@ -134,7 +118,6 @@ def register(req: RegisterRequest):
         raise HTTPException(status_code=409, detail="Email already registered")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
     token = create_token(str(user["id"]))
     return {"token": token, "user": user}
 
@@ -149,10 +132,8 @@ def login(req: LoginRequest):
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
     if not row or not pwd_ctx.verify(req.password, row["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-
     user  = {"id": str(row["id"]), "email": row["email"], "name": row["name"], "plan": row["plan"]}
     token = create_token(str(row["id"]))
     return {"token": token, "user": user}
@@ -172,10 +153,51 @@ def me(user_id: str = Depends(current_user)):
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
 
-# ── Search endpoint ───────────────────────────────────────────────────────────
+@app.post("/api/auth/google")
+def google_auth(req: GoogleAuthRequest):
+    try:
+        resp = requests.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {req.access_token}"},
+            timeout=10
+        )
+        if not resp.ok:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+        info  = resp.json()
+        email = info.get("email", "").lower().strip()
+        name  = info.get("name", email.split("@")[0])
+        if not email:
+            raise HTTPException(status_code=400, detail="Could not get email from Google")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT id, email, name, plan FROM users WHERE email = %s", (email,))
+        row = cur.fetchone()
+        if row:
+            user = dict(row)
+        else:
+            cur.execute(
+                "INSERT INTO users (email, name, password) VALUES (%s, %s, %s) RETURNING id, email, name, plan",
+                (email, name, "google-oauth-no-password")
+            )
+            user = dict(cur.fetchone())
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    token = create_token(str(user["id"]))
+    return {"token": token, "user": user}
+
+# ── Streaming Search ──────────────────────────────────────────────────────────
 
 @app.post("/api/search")
-def search(req: SearchRequest, user_id: Optional[str] = Depends(optional_user)):
+async def search(req: SearchRequest, user_id: Optional[str] = Depends(optional_user)):
+    # Step 1 — Indian Kanoon
     try:
         response = requests.post(
             "https://api.indiankanoon.org/search/",
@@ -192,69 +214,7 @@ def search(req: SearchRequest, user_id: Optional[str] = Depends(optional_user)):
         for r in results
     ])
 
-    try:
-        message = claude.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=6000,
-            messages=[{
-                "role": "user",
-                "content": f"""You are LexIndia, a senior Indian advocate and legal scholar with 30 years of experience. A lawyer searched for: "{req.query}"
-
-Relevant cases from Indian Kanoon:
-{context}
-
-Provide comprehensive legal analysis with ALL sections below in this exact order:
-
-# Legal Analysis: {req.query}
-
-## Overview
-3-4 sentences on this legal topic and its significance in Indian law.
-
-## Interpretive Framework
-How Indian courts have interpreted this provision or legal concept:
-- Which rule of interpretation applied (literal, golden, mischief, purposive, harmonious construction)
-- How meaning evolved from original enactment to present day
-- Key judges and benches who shaped the interpretation
-- Constitutional philosophy underlying the interpretation
-- Current prevailing interpretation and its limits
-
-## Jurisprudential Evolution
-Complete legal journey chronologically:
-- Original scope when the law was enacted or concept first arose
-- First major Supreme Court pronouncement and what it established
-- Decade by decade development with key cases and year
-- Turning point judgments that expanded or restricted the concept
-- Current settled legal position
-- Areas still contested or unsettled in courts today
-
-## Key Legal Principles
-Core principles from these cases. For each: state it clearly, cite the case, explain ratio decidendi, give practical significance for advocates.
-
-## Landmark Cases Analysis
-For each major case: full name and year, court, key facts, key holding and ratio decidendi, practical application today.
-
-## Constitutional and Statutory Framework
-Relevant provisions and statutes including IPC/BNS/BNSS/CrPC/Evidence Act. Include section numbers and practical application. Note BNS/BNSS replacements post July 2024.
-
-## Practical Takeaways for Advocates
-- Arguments for petitioner or appellant
-- Arguments to anticipate from other side
-- Key evidence and documentation needed
-- Common pitfalls to avoid
-- How to use interpretive framework in arguments
-- Recent developments affecting this area
-
-## Suggested Next Steps
-What the advocate should do next in terms of research, filings, and applications.
-
-Be comprehensive, precise, and practical for practising advocates in Indian courts."""
-            }]
-        )
-        summary = message.content[0].text
-    except Exception as e:
-        summary = f"AI summary unavailable: {str(e)}"
-
-    # Save to search history if logged in
+    # Save search history
     if user_id:
         try:
             conn = get_conn()
@@ -267,26 +227,74 @@ Be comprehensive, precise, and practical for practising advocates in Indian cour
             cur.close()
             conn.close()
         except Exception:
-            pass  # search history failure should never block the response
+            pass
 
-    return {"query": req.query, "cases": results, "ai_summary": summary}
+    async def stream():
+        # Send cases first — user sees results immediately
+        yield f"data: {json.dumps({'type': 'cases', 'cases': results})}\n\n"
 
-# ── Chat endpoint (with persistent sessions) ──────────────────────────────────
+        # Stream Claude analysis
+        try:
+            with claude.messages.stream(
+                model="claude-haiku-4-5",
+                max_tokens=4000,
+                messages=[{
+                    "role": "user",
+                    "content": f"""You are LexIndia, a senior Indian advocate. A lawyer searched for: "{req.query}"
+
+Relevant cases:
+{context}
+
+Provide legal analysis with these sections:
+
+# Legal Analysis: {req.query}
+
+## Overview
+3-4 sentences on this legal topic.
+
+## Key Legal Principles
+Core principles with case citations and ratio decidendi.
+
+## Landmark Cases Analysis
+For each major case: name, court, key holding, practical application today.
+
+## Constitutional and Statutory Framework
+Relevant BNS/BNSS/IPC/CrPC sections with practical application.
+
+## Practical Takeaways for Advocates
+- Arguments for petitioner
+- Key evidence needed
+- Common pitfalls
+- Recent developments
+
+Be precise and practical for Indian court advocates."""
+                }]
+            ) as stream:
+                for text in stream.text_stream:
+                    yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat")
 def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
-    session_id   = req.session_id
-    history      = req.history
+    session_id = req.session_id
+    history    = req.history
 
-    # If logged in and session_id provided, load history from DB
     if user_id and session_id:
         try:
             conn = get_conn()
             cur  = conn.cursor()
-            cur.execute(
-                "SELECT messages FROM chat_sessions WHERE id = %s AND user_id = %s",
-                (session_id, user_id)
-            )
+            cur.execute("SELECT messages FROM chat_sessions WHERE id = %s AND user_id = %s", (session_id, user_id))
             row = cur.fetchone()
             cur.close()
             conn.close()
@@ -301,7 +309,7 @@ def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
         response = claude.messages.create(
             model="claude-haiku-4-5",
             max_tokens=2000,
-            system="You are LexChat, a senior Indian advocate and legal scholar with 50 years of experience across the Supreme Court, High Courts, and Sessions Courts. Deep expertise in BNS, BNSS, IPC, CrPC, Indian Evidence Act, Constitution of India, and jurisprudence. When answering: cite relevant sections and cases, explain the interpretive framework courts use, trace jurisprudential evolution of key concepts when relevant, give practical actionable advice. Speak like a senior advocate advising a junior colleague.",
+            system="You are LexChat, a senior Indian advocate with 50 years of experience. Deep expertise in BNS, BNSS, IPC, CrPC, Indian Evidence Act, Constitution of India. Cite relevant sections and cases, give practical actionable advice.",
             messages=messages
         )
         reply = response.content[0].text
@@ -309,9 +317,8 @@ def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
         reply = f"Error: {str(e)}"
 
     updated_history = messages + [{"role": "assistant", "content": reply}]
+    new_session_id  = session_id
 
-    # Save/update session if logged in
-    new_session_id = session_id
     if user_id:
         try:
             conn = get_conn()
@@ -322,7 +329,6 @@ def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
                     (json.dumps(updated_history), session_id, user_id)
                 )
             else:
-                # Create new session — title = first 60 chars of first message
                 title = req.message[:60] + ("..." if len(req.message) > 60 else "")
                 cur.execute(
                     "INSERT INTO chat_sessions (user_id, title, messages) VALUES (%s, %s, %s) RETURNING id",
@@ -338,17 +344,12 @@ def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
 
     return {"reply": reply, "session_id": new_session_id}
 
-# ── Chat session management ───────────────────────────────────────────────────
-
 @app.get("/api/chat/sessions")
 def list_sessions(user_id: str = Depends(current_user)):
     try:
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute(
-            "SELECT id, title, updated_at FROM chat_sessions WHERE user_id = %s ORDER BY updated_at DESC LIMIT 50",
-            (user_id,)
-        )
+        cur.execute("SELECT id, title, updated_at FROM chat_sessions WHERE user_id = %s ORDER BY updated_at DESC LIMIT 50", (user_id,))
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -369,7 +370,7 @@ def delete_session(session_id: str, user_id: str = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Draft endpoint ────────────────────────────────────────────────────────────
+# ── Draft ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/draft")
 def draft(req: DraftRequest, user_id: Optional[str] = Depends(optional_user)):
@@ -379,14 +380,13 @@ def draft(req: DraftRequest, user_id: Optional[str] = Depends(optional_user)):
             max_tokens=3000,
             messages=[{
                 "role": "user",
-                "content": f"You are LexDraft, an expert Indian legal document drafter with 30 years of experience. Draft a {req.doc_type} for Court: {req.court}, Petitioner: {req.petitioner}, Respondent: {req.respondent}, Facts: {req.facts}, Grounds: {req.grounds}. Use correct BNS/BNSS sections for post-July 2024 matters, IPC/CrPC for pre-July 2024. Format as a proper court document with all standard sections including cause title, facts, grounds, prayer. Include proper legal language, citation format, and applicable precedents."
+                "content": f"You are LexDraft, an expert Indian legal document drafter. Draft a {req.doc_type} for Court: {req.court}, Petitioner: {req.petitioner}, Respondent: {req.respondent}, Facts: {req.facts}, Grounds: {req.grounds}. Use correct BNS/BNSS sections for post-July 2024, IPC/CrPC for pre-July 2024. Format as proper court document with cause title, facts, grounds, prayer."
             }]
         )
         document = message.content[0].text
     except Exception as e:
         document = f"Error: {str(e)}"
 
-    # Auto-save if requested and logged in
     saved_id = None
     if req.save and user_id and document and not document.startswith("Error"):
         try:
@@ -411,10 +411,7 @@ def list_documents(user_id: str = Depends(current_user)):
     try:
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute(
-            "SELECT id, doc_type, title, created_at FROM documents WHERE user_id = %s ORDER BY created_at DESC",
-            (user_id,)
-        )
+        cur.execute("SELECT id, doc_type, title, created_at FROM documents WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -427,61 +424,10 @@ def search_history(user_id: str = Depends(current_user)):
     try:
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute(
-            "SELECT id, query, module, created_at FROM searches WHERE user_id = %s ORDER BY created_at DESC LIMIT 50",
-            (user_id,)
-        )
+        cur.execute("SELECT id, query, module, created_at FROM searches WHERE user_id = %s ORDER BY created_at DESC LIMIT 50", (user_id,))
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
         return {"searches": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-class GoogleAuthRequest(BaseModel):
-    access_token: str
-
-@app.post("/api/auth/google")
-def google_auth(req: GoogleAuthRequest):
-    # Verify token with Google and get user info
-    try:
-        resp = requests.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {req.access_token}"},
-            timeout=10
-        )
-        if not resp.ok:
-            raise HTTPException(status_code=401, detail="Invalid Google token")
-        info = resp.json()
-        email = info.get("email", "").lower().strip()
-        name  = info.get("name", email.split("@")[0])
-        if not email:
-            raise HTTPException(status_code=400, detail="Could not get email from Google")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # Upsert user — create if not exists, login if exists
-    try:
-        conn = get_conn()
-        cur  = conn.cursor()
-        cur.execute("SELECT id, email, name, plan FROM users WHERE email = %s", (email,))
-        row = cur.fetchone()
-        if row:
-            user = dict(row)
-        else:
-            cur.execute(
-                "INSERT INTO users (email, name, password) VALUES (%s, %s, %s) RETURNING id, email, name, plan",
-                (email, name, "google-oauth-no-password")
-            )
-            user = dict(cur.fetchone())
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    token = create_token(str(user["id"]))
-    return {"token": token, "user": user}
-
