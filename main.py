@@ -92,6 +92,11 @@ class DraftRequest(BaseModel):
 class GoogleAuthRequest(BaseModel):
     access_token: str
 
+class VaultSaveRequest(BaseModel):
+    title: str
+    content: str
+    source: str = "LexSearch"
+
 @app.get("/debug-env")
 def debug_env():
     return {"db_set": DATABASE_URL is not None, "db_start": str(DATABASE_URL)[:20] if DATABASE_URL else "NONE"}
@@ -193,11 +198,8 @@ def google_auth(req: GoogleAuthRequest):
     token = create_token(str(user["id"]))
     return {"token": token, "user": user}
 
-# ── Streaming Search ──────────────────────────────────────────────────────────
-
 @app.post("/api/search")
 async def search(req: SearchRequest, user_id: Optional[str] = Depends(optional_user)):
-    # Step 1 — Indian Kanoon
     try:
         response = requests.post(
             "https://api.indiankanoon.org/search/",
@@ -214,7 +216,6 @@ async def search(req: SearchRequest, user_id: Optional[str] = Depends(optional_u
         for r in results
     ])
 
-    # Save search history
     if user_id:
         try:
             conn = get_conn()
@@ -230,10 +231,7 @@ async def search(req: SearchRequest, user_id: Optional[str] = Depends(optional_u
             pass
 
     async def stream():
-        # Send cases first — user sees results immediately
         yield f"data: {json.dumps({'type': 'cases', 'cases': results})}\n\n"
-
-        # Stream Claude analysis
         try:
             with claude.messages.stream(
                 model="claude-haiku-4-5",
@@ -274,7 +272,6 @@ Be precise and practical for Indian court advocates."""
                     yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
-
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
@@ -282,8 +279,6 @@ Be precise and practical for Indian court advocates."""
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
-
-# ── Chat ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat")
 def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
@@ -370,8 +365,6 @@ def delete_session(session_id: str, user_id: str = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Draft ─────────────────────────────────────────────────────────────────────
-
 @app.post("/api/draft")
 def draft(req: DraftRequest, user_id: Optional[str] = Depends(optional_user)):
     try:
@@ -431,10 +424,6 @@ def search_history(user_id: str = Depends(current_user)):
         return {"searches": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-class VaultSaveRequest(BaseModel):
-    title: str
-    content: str
-    doc_type: str = "LexSearch"
 
 @app.post("/api/vault/save")
 def vault_save(req: VaultSaveRequest, user_id: str = Depends(current_user)):
@@ -442,13 +431,42 @@ def vault_save(req: VaultSaveRequest, user_id: str = Depends(current_user)):
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute(
-            "INSERT INTO documents (user_id, doc_type, title, content) VALUES (%s, %s, %s, %s) RETURNING id",
-            (user_id, req.doc_type, req.title, req.content)
+            "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s) RETURNING id",
+            (user_id, req.title, req.content, req.source)
         )
         saved_id = str(cur.fetchone()["id"])
         conn.commit()
         cur.close()
         conn.close()
         return {"ok": True, "id": saved_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/vault")
+def list_vault(user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT id, title, source, created_at FROM vault WHERE user_id = %s ORDER BY created_at DESC",
+            (user_id,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return {"items": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/vault/{item_id}")
+def delete_vault(item_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
