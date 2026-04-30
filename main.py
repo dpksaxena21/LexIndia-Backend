@@ -431,3 +431,24 @@ def search_history(user_id: str = Depends(current_user)):
         return {"searches": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+class VaultSaveRequest(BaseModel):
+    title: str
+    content: str
+    doc_type: str = "LexSearch"
+
+@app.post("/api/vault/save")
+def vault_save(req: VaultSaveRequest, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO documents (user_id, doc_type, title, content) VALUES (%s, %s, %s, %s) RETURNING id",
+            (user_id, req.doc_type, req.title, req.content)
+        )
+        saved_id = str(cur.fetchone()["id"])
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"ok": True, "id": saved_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
