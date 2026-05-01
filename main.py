@@ -659,3 +659,18 @@ Be specific, cite clause numbers where present, use Indian law context."""
 @app.get("/ping")
 def ping():
     return {"ok": True}
+
+@app.get("/api/chat/sessions/{session_id}")
+def get_session(session_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT id, title, messages, updated_at FROM chat_sessions WHERE id = %s AND user_id = %s", (session_id, user_id))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return dict(row)
