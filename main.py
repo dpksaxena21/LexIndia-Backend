@@ -656,3 +656,6 @@ Be specific, cite clause numbers where present, use Indian law context."""
             pass
 
     return {"analysis": analysis, "filename": file.filename, "text_length": len(text)}
+@app.get("/ping")
+def ping():
+    return {"ok": True}
