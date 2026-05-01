@@ -115,7 +115,13 @@ class VaultSaveRequest(BaseModel):
 
 @app.get("/debug-env")
 def debug_env():
-    return {"db_set": DATABASE_URL is not None, "db_start": str(DATABASE_URL)[:20] if DATABASE_URL else "NONE"}
+    return {
+        "db_set": DATABASE_URL is not None,
+        "r2_account": R2_ACCOUNT_ID[:8] if R2_ACCOUNT_ID else "NONE",
+        "r2_key": R2_ACCESS_KEY_ID[:8] if R2_ACCESS_KEY_ID else "NONE",
+        "r2_secret": "SET" if R2_SECRET_ACCESS_KEY else "NONE",
+        "r2_bucket": R2_BUCKET_NAME,
+    }
 
 @app.get("/")
 def root():
