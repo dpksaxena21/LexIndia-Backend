@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -13,14 +13,20 @@ import psycopg2.extras
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
+import boto3
+from botocore.config import Config
 
 SECRET_KEY   = os.getenv("SECRET_KEY", "change-this-in-production-use-a-long-random-string")
 ALGORITHM    = "HS256"
 TOKEN_EXPIRY = 30
 
-DATABASE_URL        = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_PUBLIC_URL")
-CLAUDE_API_KEY      = os.getenv("CLAUDE_API_KEY")
-INDIAN_KANOON_TOKEN = os.getenv("INDIAN_KANOON_TOKEN")
+DATABASE_URL         = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PRIVATE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+CLAUDE_API_KEY       = os.getenv("CLAUDE_API_KEY")
+INDIAN_KANOON_TOKEN  = os.getenv("INDIAN_KANOON_TOKEN")
+R2_ACCOUNT_ID        = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID     = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME       = os.getenv("R2_BUCKET_NAME", "lexindia-vault")
 
 app = FastAPI(title="LexIndia API")
 
@@ -38,6 +44,16 @@ bearer  = HTTPBearer(auto_error=False)
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+def get_r2():
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
 
 def create_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(days=TOKEN_EXPIRY)
@@ -470,3 +486,69 @@ def delete_vault(item_id: str, user_id: str = Depends(current_user)):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── R2 File Upload ──────────────────────────────────────────────────────────
+
+@app.post("/api/vault/upload")
+async def vault_upload(
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    user_id: str = Depends(current_user)
+):
+    import uuid
+    ext = file.filename.split(".")[-1] if "." in file.filename else "bin"
+    key = f"{user_id}/{uuid.uuid4()}.{ext}"
+    contents = await file.read()
+    try:
+        r2 = get_r2()
+        r2.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=contents,
+            ContentType=file.content_type or "application/octet-stream",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"R2 upload failed: {str(e)}")
+    file_title = title or file.filename
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s) RETURNING id",
+            (user_id, file_title, key, "file")
+        )
+        saved_id = str(cur.fetchone()["id"])
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "id": saved_id, "key": key, "filename": file.filename}
+
+@app.get("/api/vault/file/{item_id}")
+def vault_file_url(item_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT content, title FROM vault WHERE id = %s AND user_id = %s AND source = 'file'",
+            (item_id, user_id)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+    key = row["content"]
+    try:
+        r2  = get_r2()
+        url = r2.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": R2_BUCKET_NAME, "Key": key},
+            ExpiresIn=3600
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not generate URL: {str(e)}")
+    return {"url": url, "title": row["title"]}
