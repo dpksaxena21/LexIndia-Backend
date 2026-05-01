@@ -558,3 +558,101 @@ def vault_file_url(item_id: str, user_id: str = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not generate URL: {str(e)}")
     return {"url": url, "title": row["title"]}
+
+@app.post("/api/scan")
+async def scan_document(
+    file: UploadFile = File(...),
+    question: str = Form(""),
+    user_id: Optional[str] = Depends(optional_user)
+):
+    import uuid
+    contents = await file.read()
+    
+    # Extract text based on file type
+    text = ""
+    filename = file.filename.lower()
+    
+    try:
+        if filename.endswith('.pdf'):
+            import io
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(contents))
+                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            except ImportError:
+                text = contents.decode('utf-8', errors='ignore')
+        elif filename.endswith('.txt'):
+            text = contents.decode('utf-8', errors='ignore')
+        elif filename.endswith('.docx'):
+            try:
+                import docx
+                import io
+                doc = docx.Document(io.BytesIO(contents))
+                text = "\n".join(p.text for p in doc.paragraphs)
+            except ImportError:
+                text = contents.decode('utf-8', errors='ignore')
+        else:
+            text = contents.decode('utf-8', errors='ignore')
+    except Exception as e:
+        text = f"Could not extract text: {str(e)}"
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from document")
+
+    text_preview = text[:8000]
+    
+    prompt = f"""You are LexScan, an expert Indian legal document analyzer.
+
+Document: {file.filename}
+Content:
+{text_preview}
+
+{"User question: " + question if question else ""}
+
+Provide a comprehensive analysis:
+
+## Document Overview
+Type of document, parties involved, date if present.
+
+## Key Legal Points
+Most important legal provisions, clauses, or arguments.
+
+## Obligations & Rights
+What each party must do, what rights they have.
+
+## Red Flags / Risks
+Any concerning clauses, missing elements, or legal risks.
+
+## Recommended Actions
+What the advocate should do next.
+
+{"## Answer to Question\n" + question if question else ""}
+
+Be specific, cite clause numbers where present, use Indian law context."""
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        analysis = response.content[0].text
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Save to vault if logged in
+    if user_id:
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s)",
+                (user_id, f"Scan: {file.filename}", analysis, "LexScan")
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+    return {"analysis": analysis, "filename": file.filename, "text_length": len(text)}
