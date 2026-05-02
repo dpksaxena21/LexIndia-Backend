@@ -79,6 +79,24 @@ def optional_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> Opti
     except HTTPException:
         return None
 
+def extract_text_from_file(contents: bytes, filename: str) -> str:
+    ext = filename.lower().split(".")[-1] if "." in filename else ""
+    text = ""
+    try:
+        if ext == "pdf":
+            import pypdf, io
+            reader = pypdf.PdfReader(io.BytesIO(contents))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages[:30])
+        elif ext in ["docx", "doc"]:
+            import docx, io
+            doc = docx.Document(io.BytesIO(contents))
+            text = "\n".join(p.text for p in doc.paragraphs)
+        elif ext == "txt":
+            text = contents.decode("utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    return text[:12000]
+
 class RegisterRequest(BaseModel):
     email: str
     name: str
@@ -95,6 +113,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list = []
     session_id: Optional[str] = None
+    system: Optional[str] = None
 
 class DraftRequest(BaseModel):
     doc_type: str
@@ -113,6 +132,16 @@ class VaultSaveRequest(BaseModel):
     content: str
     source: str = "LexSearch"
 
+class FolderCreateRequest(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+
+class VaultRenameRequest(BaseModel):
+    title: str
+
+class VaultMoveRequest(BaseModel):
+    folder_id: Optional[str] = None
+
 @app.get("/debug-env")
 def debug_env():
     return {
@@ -126,6 +155,10 @@ def debug_env():
 @app.get("/")
 def root():
     return {"status": "LexIndia API running"}
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
 
 @app.post("/api/auth/register")
 def register(req: RegisterRequest):
@@ -321,12 +354,13 @@ def chat(req: ChatRequest, user_id: Optional[str] = Depends(optional_user)):
             pass
 
     messages = history + [{"role": "user", "content": req.message}]
+    system_prompt = req.system or "You are LexChat, a senior Indian advocate with 50 years of experience. Deep expertise in BNS, BNSS, IPC, CrPC, Indian Evidence Act, Constitution of India. Cite relevant sections and cases, give practical actionable advice."
 
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5",
             max_tokens=2000,
-            system="You are LexChat, a senior Indian advocate with 50 years of experience. Deep expertise in BNS, BNSS, IPC, CrPC, Indian Evidence Act, Constitution of India. Cite relevant sections and cases, give practical actionable advice.",
+            system=system_prompt,
             messages=messages
         )
         reply = response.content[0].text
@@ -373,6 +407,21 @@ def list_sessions(user_id: str = Depends(current_user)):
         return {"sessions": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat/sessions/{session_id}")
+def get_session(session_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT id, title, messages, updated_at FROM chat_sessions WHERE id = %s AND user_id = %s", (session_id, user_id))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return dict(row)
 
 @app.delete("/api/chat/sessions/{session_id}")
 def delete_session(session_id: str, user_id: str = Depends(current_user)):
@@ -447,6 +496,8 @@ def search_history(user_id: str = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Vault ──────────────────────────────────────────────────────────────────
+
 @app.post("/api/vault/save")
 def vault_save(req: VaultSaveRequest, user_id: str = Depends(current_user)):
     try:
@@ -470,7 +521,7 @@ def list_vault(user_id: str = Depends(current_user)):
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute(
-            "SELECT id, title, source, created_at, folder_id, file_size, file_type FROM vault WHERE user_id = %s ORDER BY created_at DESC",
+            "SELECT id, title, source, created_at, folder_id, file_size, file_type FROM vault WHERE user_id = %s AND source != 'file_text' ORDER BY created_at DESC",
             (user_id,)
         )
         rows = [dict(r) for r in cur.fetchall()]
@@ -485,6 +536,10 @@ def delete_vault(item_id: str, user_id: str = Depends(current_user)):
     try:
         conn = get_conn()
         cur  = conn.cursor()
+        cur.execute("SELECT title FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
+        row = cur.fetchone()
+        if row:
+            cur.execute("DELETE FROM vault WHERE user_id = %s AND title = %s AND source = 'file_text'", (user_id, f"[Text] {row['title']}"))
         cur.execute("DELETE FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
         conn.commit()
         cur.close()
@@ -492,8 +547,6 @@ def delete_vault(item_id: str, user_id: str = Depends(current_user)):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# ── R2 File Upload ──────────────────────────────────────────────────────────
 
 @app.post("/api/vault/upload")
 async def vault_upload(
@@ -505,6 +558,8 @@ async def vault_upload(
     ext = file.filename.split(".")[-1] if "." in file.filename else "bin"
     key = f"{user_id}/{uuid.uuid4()}.{ext}"
     contents = await file.read()
+
+    # Upload to R2
     try:
         r2 = get_r2()
         r2.put_object(
@@ -515,20 +570,30 @@ async def vault_upload(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"R2 upload failed: {str(e)}")
+
+    # Extract text for AI analysis
+    extracted_text = extract_text_from_file(contents, file.filename)
+
     file_title = title or file.filename
     try:
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute(
-            "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s) RETURNING id",
-            (user_id, file_title, key, "file")
+            "INSERT INTO vault (user_id, title, content, source, file_size, file_type) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (user_id, file_title, key, "file", len(contents), ext.lower())
         )
         saved_id = str(cur.fetchone()["id"])
+        if extracted_text.strip():
+            cur.execute(
+                "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s)",
+                (user_id, f"[Text] {file_title}", extracted_text, "file_text")
+            )
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     return {"ok": True, "id": saved_id, "key": key, "filename": file.filename}
 
 @app.get("/api/vault/file/{item_id}")
@@ -559,133 +624,82 @@ def vault_file_url(item_id: str, user_id: str = Depends(current_user)):
         raise HTTPException(status_code=500, detail=f"Could not generate URL: {str(e)}")
     return {"url": url, "title": row["title"]}
 
-@app.post("/api/scan")
-async def scan_document(
-    file: UploadFile = File(...),
-    question: str = Form(""),
-    user_id: Optional[str] = Depends(optional_user)
-):
-    import uuid
-    contents = await file.read()
-    
-    # Extract text based on file type
-    text = ""
-    filename = file.filename.lower()
-    
-    try:
-        if filename.endswith('.pdf'):
-            import io
-            try:
-                import pypdf
-                reader = pypdf.PdfReader(io.BytesIO(contents))
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            except ImportError:
-                text = contents.decode('utf-8', errors='ignore')
-        elif filename.endswith('.txt'):
-            text = contents.decode('utf-8', errors='ignore')
-        elif filename.endswith('.docx'):
-            try:
-                import docx
-                import io
-                doc = docx.Document(io.BytesIO(contents))
-                text = "\n".join(p.text for p in doc.paragraphs)
-            except ImportError:
-                text = contents.decode('utf-8', errors='ignore')
-        else:
-            text = contents.decode('utf-8', errors='ignore')
-    except Exception as e:
-        text = f"Could not extract text: {str(e)}"
-
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from document")
-
-    text_preview = text[:8000]
-    
-    prompt = f"""You are LexScan, an expert Indian legal document analyzer.
-
-Document: {file.filename}
-Content:
-{text_preview}
-
-{"User question: " + question if question else ""}
-
-Provide a comprehensive analysis:
-
-## Document Overview
-Type of document, parties involved, date if present.
-
-## Key Legal Points
-Most important legal provisions, clauses, or arguments.
-
-## Obligations & Rights
-What each party must do, what rights they have.
-
-## Red Flags / Risks
-Any concerning clauses, missing elements, or legal risks.
-
-## Recommended Actions
-What the advocate should do next.
-
-{"## Answer to Question\n" + question if question else ""}
-
-Be specific, cite clause numbers where present, use Indian law context."""
-
-    try:
-        response = claude.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=3000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        analysis = response.content[0].text
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # Save to vault if logged in
-    if user_id:
-        try:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s)",
-                (user_id, f"Scan: {file.filename}", analysis, "LexScan")
-            )
-            conn.commit()
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
-
-    return {"analysis": analysis, "filename": file.filename, "text_length": len(text)}
-@app.get("/ping")
-def ping():
-    return {"ok": True}
-
-@app.get("/api/chat/sessions/{session_id}")
-def get_session(session_id: str, user_id: str = Depends(current_user)):
+@app.post("/api/vault/analyze/{item_id}")
+async def analyze_vault_item(item_id: str, user_id: str = Depends(current_user)):
     try:
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute("SELECT id, title, messages, updated_at FROM chat_sessions WHERE id = %s AND user_id = %s", (session_id, user_id))
+        cur.execute("SELECT title, content, source FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
         row = cur.fetchone()
         cur.close()
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     if not row:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return dict(row)
+        raise HTTPException(status_code=404, detail="Item not found")
 
-# ── LexVault File Manager ──────────────────────────────────────────────────
+    content = row["content"]
+    title   = row["title"]
 
-class FolderCreateRequest(BaseModel):
-    name: str
-    parent_id: Optional[str] = None
+    if row["source"] == "file":
+        try:
+            conn2 = get_conn()
+            cur2  = conn2.cursor()
+            cur2.execute(
+                "SELECT content FROM vault WHERE user_id = %s AND title = %s AND source = 'file_text'",
+                (user_id, f"[Text] {title}")
+            )
+            text_row = cur2.fetchone()
+            cur2.close()
+            conn2.close()
+            if text_row and text_row["content"].strip():
+                content = text_row["content"]
+            else:
+                return {
+                    "analysis": "This file was uploaded before AI analysis was enabled. Please delete and re-upload it to enable AI analysis.",
+                    "title": title
+                }
+        except Exception:
+            return {"analysis": "Could not retrieve file content for analysis.", "title": title}
 
-class VaultRenameRequest(BaseModel):
-    title: str
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": f"""Analyze this legal document saved in LexVault:
 
-class VaultMoveRequest(BaseModel):
-    folder_id: Optional[str] = None
+Title: {title}
+
+Content:
+{content[:8000]}
+
+Provide a structured analysis:
+
+## Document Summary
+What type of document this is and its main purpose.
+
+## Key Points
+The most important legal provisions, facts, or arguments.
+
+## Parties & Obligations
+Who is involved and what each party must do.
+
+## Important Dates & Deadlines
+Any critical dates mentioned.
+
+## Risks & Red Flags
+Any concerning clauses, missing elements, or legal risks.
+
+## Recommended Actions
+What the advocate should do next.
+
+Be specific and cite clause numbers where present."""}]
+        )
+        return {"analysis": response.content[0].text, "title": title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Vault Folders ──────────────────────────────────────────────────────────
 
 @app.post("/api/vault/folders")
 def create_folder(req: FolderCreateRequest, user_id: str = Depends(current_user)):
@@ -747,35 +761,81 @@ def move_vault_item(item_id: str, req: VaultMoveRequest, user_id: str = Depends(
 def list_vault_in_folder(folder_id: str, user_id: str = Depends(current_user)):
     try:
         conn = get_conn(); cur = conn.cursor()
-        cur.execute("SELECT id, title, source, created_at, folder_id FROM vault WHERE user_id = %s AND folder_id = %s ORDER BY created_at DESC", (user_id, folder_id))
+        cur.execute(
+            "SELECT id, title, source, created_at, folder_id FROM vault WHERE user_id = %s AND folder_id = %s AND source != 'file_text' ORDER BY created_at DESC",
+            (user_id, folder_id)
+        )
         items = [dict(r) for r in cur.fetchall()]
         cur.close(); conn.close()
         return {"items": items}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/vault/analyze/{item_id}")
-async def analyze_vault_item(item_id: str, user_id: str = Depends(current_user)):
-    try:
-        conn = get_conn(); cur = conn.cursor()
-        cur.execute("SELECT title, content, source FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
-        row = cur.fetchone(); cur.close(); conn.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not row:
-        raise HTTPException(status_code=404, detail="Item not found")
-    
-    content = row["content"]
-    # If it's an R2 file, we can't analyze the binary — return message
-    if row["source"] == "file":
-        return {"analysis": "File analysis: Use LexScan to upload and analyze this document with AI.", "title": row["title"]}
-    
+# ── LexScan ────────────────────────────────────────────────────────────────
+
+@app.post("/api/scan")
+async def scan_document(
+    file: UploadFile = File(...),
+    question: str = Form(""),
+    user_id: Optional[str] = Depends(optional_user)
+):
+    contents = await file.read()
+    text = extract_text_from_file(contents, file.filename)
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from document")
+
+    prompt = f"""You are LexScan, an expert Indian legal document analyzer.
+
+Document: {file.filename}
+Content:
+{text[:8000]}
+
+{"User question: " + question if question else ""}
+
+Provide a comprehensive analysis:
+
+## Document Overview
+Type of document, parties involved, date if present.
+
+## Key Legal Points
+Most important legal provisions, clauses, or arguments.
+
+## Obligations & Rights
+What each party must do, what rights they have.
+
+## Red Flags / Risks
+Any concerning clauses, missing elements, or legal risks.
+
+## Recommended Actions
+What the advocate should do next.
+
+{"## Answer to Question\n" + question if question else ""}
+
+Be specific, cite clause numbers where present, use Indian law context."""
+
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": f"Analyze this legal document saved in LexVault:\n\nTitle: {row['title']}\n\nContent:\n{content[:6000]}\n\nProvide: key points, important dates/parties, risks, recommended actions."}]
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}]
         )
-        return {"analysis": response.content[0].text, "title": row["title"]}
+        analysis = response.content[0].text
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    if user_id:
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO vault (user_id, title, content, source) VALUES (%s, %s, %s, %s)",
+                (user_id, f"Scan: {file.filename}", analysis, "LexScan")
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+    return {"analysis": analysis, "filename": file.filename, "text_length": len(text)}
