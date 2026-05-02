@@ -470,7 +470,7 @@ def list_vault(user_id: str = Depends(current_user)):
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute(
-            "SELECT id, title, source, created_at FROM vault WHERE user_id = %s ORDER BY created_at DESC",
+            "SELECT id, title, source, created_at, folder_id, file_size, file_type FROM vault WHERE user_id = %s ORDER BY created_at DESC",
             (user_id,)
         )
         rows = [dict(r) for r in cur.fetchall()]
