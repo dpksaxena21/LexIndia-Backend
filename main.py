@@ -839,3 +839,58 @@ Be specific, cite clause numbers where present, use Indian law context."""
             pass
 
     return {"analysis": analysis, "filename": file.filename, "text_length": len(text)}
+@app.post("/api/vault/scan/{item_id}")
+async def scan_vault_item(item_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT title, content, source FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
+        row = cur.fetchone(); cur.close(); conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if row["source"] != "file":
+        raise HTTPException(status_code=400, detail="Only uploaded files can be scanned")
+    try:
+        import boto3, io
+        from botocore.config import Config
+        r2 = get_r2()
+        obj = r2.get_object(Bucket=R2_BUCKET_NAME, Key=row["content"])
+        contents = obj["Body"].read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch file: {str(e)}")
+    text = extract_text_from_file(contents, row["title"])
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from file")
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=3000,
+            messages=[{"role": "user", "content": f"""You are LexScan, an expert Indian legal document analyzer.
+
+Document: {row['title']}
+Content:
+{text[:8000]}
+
+Provide a comprehensive analysis:
+
+## Document Overview
+Type of document, parties involved, date if present.
+
+## Key Legal Points
+Most important legal provisions, clauses, or arguments.
+
+## Obligations & Rights
+What each party must do, what rights they have.
+
+## Red Flags / Risks
+Any concerning clauses, missing elements, or legal risks.
+
+## Recommended Actions
+What the advocate should do next.
+
+Be specific, cite clause numbers where present."""}]
+        )
+        return {"analysis": response.content[0].text, "title": row["title"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
