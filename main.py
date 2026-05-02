@@ -32,7 +32,7 @@ app = FastAPI(title="LexIndia API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://lexindia-one.vercel.app", "https://*.vercel.app"],
+    allow_origins=["http://localhost:3000", "https://lexindia-one.vercel.app", "https://lexsindia.com", "https://www.lexsindia.com", "https://*.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
