@@ -674,3 +674,108 @@ def get_session(session_id: str, user_id: str = Depends(current_user)):
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
     return dict(row)
+
+# ── LexVault File Manager ──────────────────────────────────────────────────
+
+class FolderCreateRequest(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+
+class VaultRenameRequest(BaseModel):
+    title: str
+
+class VaultMoveRequest(BaseModel):
+    folder_id: Optional[str] = None
+
+@app.post("/api/vault/folders")
+def create_folder(req: FolderCreateRequest, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO vault_folders (user_id, name, parent_id) VALUES (%s, %s, %s) RETURNING id, name, parent_id, created_at",
+            (user_id, req.name, req.parent_id)
+        )
+        folder = dict(cur.fetchone())
+        conn.commit(); cur.close(); conn.close()
+        return folder
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/vault/folders")
+def list_folders(user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT id, name, parent_id, created_at FROM vault_folders WHERE user_id = %s ORDER BY name", (user_id,))
+        folders = [dict(r) for r in cur.fetchall()]
+        cur.close(); conn.close()
+        return {"folders": folders}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/vault/folders/{folder_id}")
+def delete_folder(folder_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("DELETE FROM vault_folders WHERE id = %s AND user_id = %s", (folder_id, user_id))
+        cur.execute("UPDATE vault SET folder_id = NULL WHERE folder_id = %s AND user_id = %s", (folder_id, user_id))
+        conn.commit(); cur.close(); conn.close()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/vault/{item_id}/rename")
+def rename_vault_item(item_id: str, req: VaultRenameRequest, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("UPDATE vault SET title = %s WHERE id = %s AND user_id = %s", (req.title, item_id, user_id))
+        conn.commit(); cur.close(); conn.close()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/vault/{item_id}/move")
+def move_vault_item(item_id: str, req: VaultMoveRequest, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("UPDATE vault SET folder_id = %s WHERE id = %s AND user_id = %s", (req.folder_id, item_id, user_id))
+        conn.commit(); cur.close(); conn.close()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/vault/folder/{folder_id}")
+def list_vault_in_folder(folder_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT id, title, source, created_at, folder_id FROM vault WHERE user_id = %s AND folder_id = %s ORDER BY created_at DESC", (user_id, folder_id))
+        items = [dict(r) for r in cur.fetchall()]
+        cur.close(); conn.close()
+        return {"items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/vault/analyze/{item_id}")
+async def analyze_vault_item(item_id: str, user_id: str = Depends(current_user)):
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("SELECT title, content, source FROM vault WHERE id = %s AND user_id = %s", (item_id, user_id))
+        row = cur.fetchone(); cur.close(); conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    content = row["content"]
+    # If it's an R2 file, we can't analyze the binary — return message
+    if row["source"] == "file":
+        return {"analysis": "File analysis: Use LexScan to upload and analyze this document with AI.", "title": row["title"]}
+    
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": f"Analyze this legal document saved in LexVault:\n\nTitle: {row['title']}\n\nContent:\n{content[:6000]}\n\nProvide: key points, important dates/parties, risks, recommended actions."}]
+        )
+        return {"analysis": response.content[0].text, "title": row["title"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
