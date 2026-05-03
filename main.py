@@ -27,6 +27,7 @@ R2_ACCOUNT_ID        = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID     = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME       = os.getenv("R2_BUCKET_NAME", "lexindia-vault")
+TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY")
 
 app = FastAPI(title="LexIndia API")
 
@@ -150,6 +151,7 @@ def debug_env():
         "r2_key": R2_ACCESS_KEY_ID[:8] if R2_ACCESS_KEY_ID else "NONE",
         "r2_secret": "SET" if R2_SECRET_ACCESS_KEY else "NONE",
         "r2_bucket": R2_BUCKET_NAME,
+        "tavily": "SET" if TAVILY_API_KEY else "NONE",
     }
 
 @app.get("/")
@@ -892,5 +894,53 @@ What the advocate should do next.
 Be specific, cite clause numbers where present."""}]
         )
         return {"analysis": response.content[0].text, "title": row["title"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── LexPulse: Legal News ───────────────────────────────────────────────────
+
+@app.get("/api/pulse")
+async def get_legal_news(category: str = "all"):
+    if not TAVILY_API_KEY:
+        raise HTTPException(status_code=503, detail="News service not configured")
+    try:
+        queries = {
+            "all": "Indian legal news Supreme Court High Court 2025",
+            "supreme": "Supreme Court of India judgment 2025",
+            "highcourt": "High Court India judgment 2025",
+            "legislation": "India new law amendment act 2025",
+            "bns": "BNS BNSS India criminal law 2025",
+        }
+        query = queries.get(category, queries["all"])
+        import httpx
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "search_depth": "basic",
+                    "include_answer": False,
+                    "include_images": False,
+                    "max_results": 12,
+                    "include_domains": [
+                        "livelaw.in", "barandbench.com", "scobserver.in",
+                        "thehindu.com", "indialegallive.com", "legalserviceindia.com",
+                        "sci.gov.in", "mea.gov.in", "prsindia.org"
+                    ]
+                },
+                timeout=15
+            )
+            data = res.json()
+            results = data.get("results", [])
+            articles = [{
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "source": r.get("url", "").split("/")[2].replace("www.", "") if r.get("url") else "",
+                "summary": r.get("content", "")[:300],
+                "date": r.get("published_date", ""),
+            } for r in results if r.get("title")]
+            return {"articles": articles, "category": category, "count": len(articles)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
