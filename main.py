@@ -910,11 +910,11 @@ async def get_legal_news(category: str = "all"):
         raise HTTPException(status_code=503, detail="News service not configured")
     try:
         queries = {
-            "all": "Indian legal news Supreme Court High Court 2025",
-            "supreme": "Supreme Court of India judgment 2025",
-            "highcourt": "High Court India judgment 2025",
-            "legislation": "India new law amendment act 2025",
-            "bns": "BNS BNSS India criminal law 2025",
+            "all": "Indian legal news Supreme Court High Court 2026",
+            "supreme": "Supreme Court of India judgment 2026",
+            "highcourt": "High Court India judgment 2026",
+            "legislation": "India new law amendment act 2026",
+            "bns": "BNS BNSS India criminal law 2026",
         }
         query = queries.get(category, queries["all"])
         import httpx
@@ -1037,7 +1037,7 @@ async def get_today_news():
                     "https://api.tavily.com/search",
                     json={
                         "api_key": TAVILY_API_KEY,
-                        "query": "India Supreme Court High Court judgment news today 2025",
+                        "query": "India Supreme Court High Court judgment news today May 2026",
                         "search_depth": "basic",
                         "max_results": 10,
                         "include_domains": ["livelaw.in","barandbench.com","thehindu.com","indianexpress.com"]
