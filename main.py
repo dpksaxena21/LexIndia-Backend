@@ -944,3 +944,45 @@ async def get_legal_news(category: str = "all"):
             return {"articles": articles, "category": category, "count": len(articles)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/pulse/rss")
+async def get_rss_news():
+    import httpx
+    import xml.etree.ElementTree as ET
+    from datetime import datetime
+    
+    feeds = [
+        {"url": "https://www.livelaw.in/rss", "source": "livelaw.in"},
+        {"url": "https://www.barandbench.com/rss", "source": "barandbench.com"},
+        {"url": "https://main.sci.gov.in/rss.xml", "source": "sci.gov.in"},
+    ]
+    
+    articles = []
+    async with httpx.AsyncClient(timeout=10) as client:
+        for feed in feeds:
+            try:
+                res = await client.get(feed["url"], headers={"User-Agent": "Mozilla/5.0"})
+                root = ET.fromstring(res.text)
+                items = root.findall(".//item")[:6]
+                for item in items:
+                    title = item.findtext("title", "").strip()
+                    url = item.findtext("link", "").strip()
+                    desc = item.findtext("description", "").strip()
+                    pub_date = item.findtext("pubDate", "").strip()
+                    if title and url:
+                        # Clean HTML from description
+                        import re
+                        desc = re.sub(r'<[^>]+>', '', desc)[:300]
+                        articles.append({
+                            "title": title,
+                            "url": url,
+                            "source": feed["source"],
+                            "summary": desc,
+                            "date": pub_date,
+                            "fresh": True
+                        })
+            except Exception as e:
+                continue
+    
+    return {"articles": articles, "count": len(articles), "source": "rss"}
