@@ -1082,6 +1082,34 @@ async def get_today_news():
     
     return {"articles": unique[:20], "count": len(unique), "newsapi": bool(NEWSAPI_KEY), "tavily": bool(TAVILY_API_KEY)}
 
+
+@app.get("/api/vault/search")
+def search_vault(q: str, user_id: str = Depends(current_user)):
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Search query too short")
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, title, source, created_at, folder_id,
+                           LEFT(content, 200) as snippet,
+                           ts_rank(to_tsvector('english', COALESCE(title,'') || ' ' || COALESCE(content,'')),
+                                   plainto_tsquery('english', %s)) as rank
+                    FROM vault
+                    WHERE user_id = %s
+                      AND source != 'file_text'
+                      AND (
+                          title ILIKE %s
+                          OR content ILIKE %s
+                      )
+                    ORDER BY rank DESC, created_at DESC
+                    LIMIT 20
+                """, (q, user_id, f'%{q}%', f'%{q}%'))
+                results = cur.fetchall()
+                return {"results": [dict(r) for r in results], "count": len(results), "query": q}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ─── LEXTRACK ─────────────────────────────────────────────────────────────────
 ECOURTS_API_KEY = os.getenv("ECOURTS_API_KEY", "")
 ECOURTS_BASE = "https://webapi.ecourtsindia.com/api/partner"
