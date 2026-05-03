@@ -927,9 +927,7 @@ async def get_legal_news(category: str = "all"):
                     "include_images": False,
                     "max_results": 12,
                     "include_domains": [
-                        "livelaw.in", "barandbench.com", "scobserver.in",
-                        "thehindu.com", "indialegallive.com", "legalserviceindia.com",
-                        "sci.gov.in", "mea.gov.in", "prsindia.org"
+                        "livelaw.in", "barandbench.com", "scobserver.in", "thehindu.com", "indialegallive.com", "legalserviceindia.com", "sci.gov.in", "mea.gov.in", "prsindia.org", "indianexpress.com", "doj.gov.in", "hindustantimes.com", "ndtv.com"
                     ]
                 },
                 timeout=15
