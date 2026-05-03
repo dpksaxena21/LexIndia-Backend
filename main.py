@@ -28,6 +28,7 @@ R2_ACCESS_KEY_ID     = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME       = os.getenv("R2_BUCKET_NAME", "lexindia-vault")
 TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY")
+TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY")
 
 app = FastAPI(title="LexIndia API")
 
@@ -151,6 +152,7 @@ def debug_env():
         "r2_key": R2_ACCESS_KEY_ID[:8] if R2_ACCESS_KEY_ID else "NONE",
         "r2_secret": "SET" if R2_SECRET_ACCESS_KEY else "NONE",
         "r2_bucket": R2_BUCKET_NAME,
+        "tavily": "SET" if TAVILY_API_KEY else "NONE",
         "tavily": "SET" if TAVILY_API_KEY else "NONE",
     }
 
