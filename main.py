@@ -28,7 +28,9 @@ R2_ACCESS_KEY_ID     = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME       = os.getenv("R2_BUCKET_NAME", "lexindia-vault")
 TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY")
+NEWSAPI_KEY          = os.getenv("NEWSAPI_KEY")
 TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY")
+NEWSAPI_KEY          = os.getenv("NEWSAPI_KEY")
 
 app = FastAPI(title="LexIndia API")
 
@@ -986,3 +988,96 @@ async def get_rss_news():
                 continue
     
     return {"articles": articles, "count": len(articles), "source": "rss"}
+
+
+@app.get("/api/pulse/today")
+async def get_today_news():
+    import httpx
+    from datetime import datetime, timedelta
+    
+    articles = []
+    
+    # Source 1: NewsAPI - today's fresh news
+    if NEWSAPI_KEY:
+        try:
+            from_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.get(
+                    "https://newsapi.org/v2/everything",
+                    params={
+                        "q": "India Supreme Court High Court legal judgment law",
+                        "language": "en",
+                        "sortBy": "publishedAt",
+                        "pageSize": 15,
+                        "from": from_date,
+                        "domains": "livelaw.in,barandbench.com,thehindu.com,indianexpress.com,ndtv.com,hindustantimes.com",
+                        "apiKey": NEWSAPI_KEY,
+                    }
+                )
+                data = res.json()
+                for a in data.get("articles", []):
+                    if a.get("title") and "[Removed]" not in a.get("title",""):
+                        articles.append({
+                            "title": a.get("title",""),
+                            "url": a.get("url",""),
+                            "source": a.get("source",{}).get("name",""),
+                            "summary": (a.get("description") or a.get("content") or "")[:300],
+                            "date": a.get("publishedAt",""),
+                            "fresh": True,
+                            "provider": "newsapi"
+                        })
+        except Exception as e:
+            pass
+    
+    # Source 2: Tavily for deeper legal queries
+    if TAVILY_API_KEY and len(articles) < 10:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                res = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": TAVILY_API_KEY,
+                        "query": "India Supreme Court High Court judgment news today 2025",
+                        "search_depth": "basic",
+                        "max_results": 10,
+                        "include_domains": ["livelaw.in","barandbench.com","thehindu.com","indianexpress.com"]
+                    }
+                )
+                data = res.json()
+                for r in data.get("results", []):
+                    if r.get("title"):
+                        articles.append({
+                            "title": r.get("title",""),
+                            "url": r.get("url",""),
+                            "source": r.get("url","").split("/")[2].replace("www.","") if r.get("url") else "",
+                            "summary": r.get("content","")[:300],
+                            "date": r.get("published_date",""),
+                            "fresh": False,
+                            "provider": "tavily"
+                        })
+        except:
+            pass
+    
+    # Sort by date, fresh first
+    def sort_key(a):
+        if a.get("fresh") and a.get("date"):
+            try:
+                from datetime import timezone
+                d = datetime.fromisoformat(a["date"].replace("Z","+00:00"))
+                return d.timestamp()
+            except:
+                return 0
+        return 0
+    
+    articles.sort(key=sort_key, reverse=True)
+    
+    # Deduplicate by title similarity
+    seen = set()
+    unique = []
+    for a in articles:
+        key = a["title"][:50].lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(a)
+    
+    return {"articles": unique[:20], "count": len(unique), "newsapi": bool(NEWSAPI_KEY), "tavily": bool(TAVILY_API_KEY)}
