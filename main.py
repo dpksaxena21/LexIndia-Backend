@@ -1081,3 +1081,83 @@ async def get_today_news():
             unique.append(a)
     
     return {"articles": unique[:20], "count": len(unique), "newsapi": bool(NEWSAPI_KEY), "tavily": bool(TAVILY_API_KEY)}
+
+# ─── LEXTRACK ─────────────────────────────────────────────────────────────────
+ECOURTS_API_KEY = os.getenv("ECOURTS_API_KEY", "")
+ECOURTS_BASE = "https://webapi.ecourtsindia.com/api/partner"
+
+@app.get("/api/track/case/{cnr}")
+async def track_case(cnr: str, current_user: dict = Depends(optional_user)):
+    if not ECOURTS_API_KEY:
+        raise HTTPException(status_code=503, detail="eCourts API not configured")
+    cnr = cnr.strip().upper().replace("-", "").replace(" ", "")
+    if len(cnr) < 12:
+        raise HTTPException(status_code=400, detail="Invalid CNR number. Must be at least 12 characters.")
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"{ECOURTS_BASE}/case/{cnr}",
+                headers={"Authorization": f"Bearer {ECOURTS_API_KEY}"},
+                timeout=20
+            )
+            if res.status_code == 404:
+                raise HTTPException(status_code=404, detail="Case not found. Please check the CNR number.")
+            if res.status_code != 200:
+                raise HTTPException(status_code=res.status_code, detail="eCourts API error")
+            data = res.json()
+            case = data.get("data", {}).get("courtCaseData", {})
+            # Clean and structure the response
+            return {
+                "ok": True,
+                "cnr": cnr,
+                "case_number": case.get("caseNumber", ""),
+                "court": case.get("courtName", ""),
+                "court_no": case.get("courtNo", ""),
+                "state": case.get("state", ""),
+                "judicial_section": case.get("judicialSectionRaw", ""),
+                "status": case.get("disposalTypeRaw", "PENDING"),
+                "purpose": case.get("purpose", ""),
+                "last_hearing": case.get("lastHearingDate", ""),
+                "next_hearing": case.get("nextHearingDate", ""),
+                "judge": case.get("judgeName", ""),
+                "petitioner": case.get("petitionerAdvocate", case.get("petitioner", "")),
+                "respondent": case.get("respondentAdvocate", case.get("respondent", "")),
+                "history": case.get("historyOfCaseHearings", [])[:10],
+                "orders": case.get("interimOrders", [])[:5],
+                "fir": case.get("firDetails", {}),
+                "raw": case,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch case: {str(e)}")
+
+@app.get("/api/track/search")
+async def search_cases(
+    party: str = "",
+    advocate: str = "",
+    court: str = "DLHC",
+    current_user: dict = Depends(optional_user)
+):
+    if not party and not advocate:
+        raise HTTPException(status_code=400, detail="Provide party name or advocate name")
+    if not ECOURTS_API_KEY:
+        raise HTTPException(status_code=503, detail="eCourts API not configured")
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            params = {"court": court}
+            if party: params["party"] = party
+            if advocate: params["advocate"] = advocate
+            res = await client.get(
+                f"{ECOURTS_BASE}/search",
+                headers={"Authorization": f"Bearer {ECOURTS_API_KEY}"},
+                params=params,
+                timeout=20
+            )
+            data = res.json()
+            return {"ok": True, "results": data.get("data", {}).get("cases", []), "count": len(data.get("data", {}).get("cases", []))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
