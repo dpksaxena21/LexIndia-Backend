@@ -121,11 +121,12 @@ class ChatRequest(BaseModel):
 
 class DraftRequest(BaseModel):
     doc_type: str
-    court: str
-    petitioner: str
-    respondent: str
-    facts: str
-    grounds: str
+    court: str = ""
+    petitioner: str = ""
+    respondent: str = ""
+    facts: str = ""
+    grounds: str = ""
+    fields: dict = {}
     save: bool = False
 
 class GoogleAuthRequest(BaseModel):
@@ -442,16 +443,68 @@ def delete_session(session_id: str, user_id: str = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+DRAFT_PROMPTS = {
+    "Regular Bail Application (S.483 BNSS)": "You are LexDraft, expert Indian criminal lawyer. Draft a Regular Bail Application under Section 483 BNSS 2023. Use proper court format with cause title, FIR details, grounds for bail, and prayer. Use BNSS sections throughout. Be formal and precise.",
+    "Anticipatory Bail Application (S.482 BNSS)": "You are LexDraft, expert Indian criminal lawyer. Draft Anticipatory Bail Application under Section 482 BNSS 2023. Include apprehension of arrest, clean antecedents, cooperation with investigation, no flight risk. Formal court format.",
+    "Quashing Petition (S.528 BNSS)": "Draft a Quashing Petition under Section 528 BNSS / Article 226 Constitution. Include grounds for quashing, cite Bhajan Lal guidelines, prayer for quashing FIR/proceedings.",
+    "Board Resolution": "You are LexDraft, expert Company Secretary. Draft a Board Resolution as per Companies Act 2013. Format: CERTIFIED TRUE COPY OF RESOLUTION. Include RESOLVED THAT clauses, quorum confirmation, DIN numbers. Professional secretarial format.",
+    "Shareholders Resolution (Ordinary/Special)": "Draft a Shareholders Resolution under Companies Act 2013. Include meeting notice, quorum, voting details, resolution text. For Special Resolution state 3/4 majority. Follow Secretarial Standards SS-2.",
+    "Share Transfer Agreement": "Draft a Share Transfer Agreement under Companies Act 2013 Section 56. Include transferor/transferee details, company info, shares description, consideration, representations, closing mechanics, stamp duty clause.",
+    "Non-Disclosure Agreement (NDA)": "Draft a comprehensive NDA under Indian law. Include definition of confidential information, obligations, exceptions, term, remedies, governing law (Indian), arbitration under Arbitration & Conciliation Act 1996.",
+    "Memorandum of Understanding (MOU)": "Draft a detailed MOU. Include recitals, scope, responsibilities, exclusivity, term, termination, confidentiality, non-binding nature, governing law. Professional corporate format.",
+    "Employment Agreement": "Draft an Employment Agreement compliant with Indian labour laws. Include designation, CTC, probation, notice period, confidentiality, non-compete, IP assignment, termination. Reference applicable Shops & Establishments Act.",
+    "Partnership Deed": "Draft a Partnership Deed under Indian Partnership Act 1932. Include firm name, partners, capital, profit sharing, duties, banking, admission/retirement provisions, dissolution, arbitration.",
+    "Joint Venture Agreement": "Draft a Joint Venture Agreement under Indian law. Include purpose, shareholding, governance, funding, IP ownership, non-compete, exit mechanisms (tag-along, drag-along), deadlock resolution.",
+    "Civil Suit (Plaint)": "Draft a Civil Plaint as per Order VII CPC 1908. Include jurisdiction, cause of action, valuation, relief sought, verification. Proper court format.",
+    "Injunction Application (Order 39 CPC)": "Draft an Injunction Application under Order 39 Rules 1 & 2 CPC. Include prima facie case, balance of convenience, irreparable harm. Cite Dalpat Kumar v. Prahlad Singh. Include urgent prayer.",
+    "Writ Petition (Article 226)": "Draft a Writ Petition under Article 226 Constitution. Include jurisdictional facts, right violated, impugned action, grounds, prayer for certiorari/mandamus/prohibition as applicable.",
+    "Divorce Petition (Mutual Consent - S.13B HMA)": "Draft a Divorce Petition under Section 13B Hindu Marriage Act 1955. Include marriage details, separation period (minimum 1 year), settlement terms, both parties consent, prayer for decree.",
+    "Maintenance Application (S.144 BNSS)": "Draft a Maintenance Application under Section 144 BNSS 2023. Include relationship, respondent income, applicant inability to maintain, amount sought, interim maintenance prayer.",
+    "Child Custody Petition": "Draft a Child Custody Petition under Guardian & Wards Act 1890. Include child details, parents details, current custody situation, best interests of child, prayer for custody/visitation.",
+    "Sale Deed": "Draft a Sale Deed under Registration Act 1908 and Transfer of Property Act 1882. Include parties, complete property description with boundaries, consideration, payment, title warranty, possession, indemnity, stamp duty clause.",
+    "Rent Agreement / Lease Deed": "Draft a Rent Agreement under Transfer of Property Act 1882. Include landlord/tenant, property description, rent amount, security deposit, maintenance, lock-in, termination notice, prohibited uses.",
+    "Gift Deed": "Draft a Gift Deed under Transfer of Property Act 1882 Section 122. Include donor/donee, property description, voluntary nature, acceptance, possession delivery, stamp duty and registration note.",
+    "Termination Letter": "Draft an Employment Termination Letter compliant with Industrial Disputes Act 1947. Include reason, notice period or payment in lieu, full and final settlement, relieving date, return of company property.",
+    "Show Cause Notice (Employment)": "Draft a Show Cause Notice for disciplinary proceedings. Include specific allegations with dates, opportunity to explain, response timeline (48-72 hours), consequences of non-response.",
+    "Labour Court Complaint (ID Act)": "Draft a Labour Court Complaint under Industrial Disputes Act 1947. Include parties, employment history, nature of dispute, relief sought (reinstatement/compensation).",
+    "Consumer Complaint (NCDRC/State/District)": "Draft a Consumer Complaint under Consumer Protection Act 2019. Include complainant/opposite party, defect/deficiency details, amount paid, relief sought (refund/replacement/compensation), jurisdictional value.",
+    "Trademark Cease & Desist": "Draft a Trademark Cease & Desist Notice under Trade Marks Act 1999 Sections 29, 134, 135. Include registered trademark details, infringement details, demand to cease, deadline, threat of legal action.",
+    "SLP (Special Leave Petition) - Art. 136": "Draft an SLP under Article 136 Constitution of India. Include impugned judgment details, questions of law, grounds, prayer for leave to appeal and stay. Proper Supreme Court format.",
+    "Writ Petition (Art. 32) - Fundamental Rights": "Draft a Writ Petition under Article 32 Constitution. Include fundamental right violated with specific Article, state action challenged, grounds, prayer for appropriate writ.",
+    "Legal Notice": "Draft a formal Legal Notice. Include sender/recipient details, subject matter, legal basis, specific demand, deadline for compliance, consequence of non-compliance. Sent via Speed Post.",
+    "Vakalatnama": "Draft a Vakalatnama (Power of Attorney for legal representation). Include client name, advocate name, court, case details, powers granted, signatures required.",
+    "Affidavit": "Draft a formal Affidavit. Include deponent details, sworn statement format, specific facts in numbered paragraphs, verification clause, notary/oath commissioner format.",
+}
+
+DEFAULT_PROMPT = "You are LexDraft, an expert Indian legal document drafter. Draft a {doc_type}. Use correct legal format, cite relevant Indian laws and sections. Be formal and precise. Use BNS/BNSS for post-July 2024 matters, IPC/CrPC for pre-July 2024."
+
 @app.post("/api/draft")
 def draft(req: DraftRequest, user_id: Optional[str] = Depends(optional_user)):
     try:
+        # Get document-specific prompt
+        base_prompt = DRAFT_PROMPTS.get(req.doc_type, DEFAULT_PROMPT.format(doc_type=req.doc_type))
+        
+        # Build field context from both old fields and new flexible fields
+        field_context = ""
+        all_fields = {
+            "Court": req.court,
+            "Petitioner / Party 1": req.petitioner,
+            "Respondent / Party 2": req.respondent,
+            "Facts": req.facts,
+            "Grounds / Prayer": req.grounds,
+            **req.fields
+        }
+        for k, v in all_fields.items():
+            if v and str(v).strip():
+                field_context += f"\n{k}: {v}"
+        
+        user_message = f"Draft document type: {req.doc_type}\n\nDetails provided:{field_context}\n\nGenerate a complete, professional legal document ready for use."
+        
         message = claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=3000,
-            messages=[{
-                "role": "user",
-                "content": f"You are LexDraft, an expert Indian legal document drafter. Draft a {req.doc_type} for Court: {req.court}, Petitioner: {req.petitioner}, Respondent: {req.respondent}, Facts: {req.facts}, Grounds: {req.grounds}. Use correct BNS/BNSS sections for post-July 2024, IPC/CrPC for pre-July 2024. Format as proper court document with cause title, facts, grounds, prayer."
-            }]
+            max_tokens=4000,
+            system=base_prompt,
+            messages=[{"role": "user", "content": user_message}]
         )
         document = message.content[0].text
     except Exception as e:
